@@ -273,178 +273,6 @@ Position StructuredMesh::sample_element(
     y_min + (y_max - y_min) * prn(seed), z_min + (z_max - z_min) * prn(seed)};
 }
 
-//==============================================================================
-// Unstructured Mesh implementation
-//==============================================================================
-
-UnstructuredMesh::UnstructuredMesh(pugi::xml_node node) : Mesh(node)
-{
-
-  // check the mesh type
-  if (check_for_node(node, "type")) {
-    auto temp = get_node_value(node, "type", true, true);
-    if (temp != mesh_type) {
-      fatal_error(fmt::format("Invalid mesh type: {}", temp));
-    }
-  }
-
-  // check if a length unit multiplier was specified
-  if (check_for_node(node, "length_multiplier")) {
-    length_multiplier_ = std::stod(get_node_value(node, "length_multiplier"));
-    specified_length_multiplier_ = true;
-  }
-
-  // get the filename of the unstructured mesh to load
-  if (check_for_node(node, "filename")) {
-    filename_ = get_node_value(node, "filename");
-    if (!file_exists(filename_)) {
-      fatal_error("Mesh file '" + filename_ + "' does not exist!");
-    }
-  } else {
-    fatal_error(fmt::format(
-      "No filename supplied for unstructured mesh with ID: {}", id_));
-  }
-
-  // check if mesh tally data should be written with
-  // statepoint files
-  if (check_for_node(node, "output")) {
-    output_ = get_node_value_bool(node, "output");
-  }
-}
-
-Position UnstructuredMesh::sample_tet(
-  std::array<Position, 4> coords, uint64_t* seed) const
-{
-  // Uniform distribution
-  double s = prn(seed);
-  double t = prn(seed);
-  double u = prn(seed);
-
-  // From PyNE implementation of moab tet sampling C. Rocchini & P. Cignoni
-  // (2000) Generating Random Points in a Tetrahedron, Journal of Graphics
-  // Tools, 5:4, 9-12, DOI: 10.1080/10867651.2000.10487528
-  if (s + t > 1) {
-    s = 1.0 - s;
-    t = 1.0 - t;
-  }
-  if (s + t + u > 1) {
-    if (t + u > 1) {
-      double old_t = t;
-      t = 1.0 - u;
-      u = 1.0 - s - old_t;
-    } else if (t + u <= 1) {
-      double old_s = s;
-      s = 1.0 - t - u;
-      u = old_s + t + u - 1;
-    }
-  }
-  return s * (coords[1] - coords[0]) + t * (coords[2] - coords[0]) +
-         u * (coords[3] - coords[0]) + coords[0];
-}
-
-const std::string UnstructuredMesh::mesh_type = "unstructured";
-
-std::string UnstructuredMesh::get_mesh_type() const
-{
-  return mesh_type;
-}
-
-void UnstructuredMesh::surface_bins_crossed(
-  Position r0, Position r1, const Direction& u, vector<int>& bins) const
-{
-  fatal_error("Unstructured mesh surface tallies are not implemented.");
-}
-
-std::string UnstructuredMesh::bin_label(int bin) const
-{
-  return fmt::format("Mesh Index ({})", bin);
-};
-
-void UnstructuredMesh::to_hdf5(hid_t group) const
-{
-  hid_t mesh_group = create_group(group, fmt::format("mesh {}", id_));
-
-  write_dataset(mesh_group, "type", mesh_type);
-  write_dataset(mesh_group, "filename", filename_);
-  write_dataset(mesh_group, "library", this->library());
-
-  if (specified_length_multiplier_)
-    write_dataset(mesh_group, "length_multiplier", length_multiplier_);
-
-  // write vertex coordinates
-  xt::xtensor<double, 2> vertices({static_cast<size_t>(this->n_vertices()), 3});
-  for (int i = 0; i < this->n_vertices(); i++) {
-    auto v = this->vertex(i);
-    xt::view(vertices, i, xt::all()) = xt::xarray<double>({v.x, v.y, v.z});
-  }
-  write_dataset(mesh_group, "vertices", vertices);
-
-  int num_elem_skipped = 0;
-
-  // write element types and connectivity
-  vector<double> volumes;
-  xt::xtensor<int, 2> connectivity({static_cast<size_t>(this->n_bins()), 8});
-  xt::xtensor<int, 2> elem_types({static_cast<size_t>(this->n_bins()), 1});
-  for (int i = 0; i < this->n_bins(); i++) {
-    auto conn = this->connectivity(i);
-
-    volumes.emplace_back(this->volume(i));
-
-    // write linear tet element
-    if (conn.size() == 4) {
-      xt::view(elem_types, i, xt::all()) =
-        static_cast<int>(ElementType::LINEAR_TET);
-      xt::view(connectivity, i, xt::all()) =
-        xt::xarray<int>({conn[0], conn[1], conn[2], conn[3], -1, -1, -1, -1});
-      // write linear hex element
-    } else if (conn.size() == 8) {
-      xt::view(elem_types, i, xt::all()) =
-        static_cast<int>(ElementType::LINEAR_HEX);
-      xt::view(connectivity, i, xt::all()) = xt::xarray<int>({conn[0], conn[1],
-        conn[2], conn[3], conn[4], conn[5], conn[6], conn[7]});
-    } else {
-      num_elem_skipped++;
-      xt::view(elem_types, i, xt::all()) =
-        static_cast<int>(ElementType::UNSUPPORTED);
-      xt::view(connectivity, i, xt::all()) = -1;
-    }
-  }
-
-  // warn users that some elements were skipped
-  if (num_elem_skipped > 0) {
-    warning(fmt::format("The connectivity of {} elements "
-                        "on mesh {} were not written "
-                        "because they are not of type linear tet/hex.",
-      num_elem_skipped, this->id_));
-  }
-
-  write_dataset(mesh_group, "volumes", volumes);
-  write_dataset(mesh_group, "connectivity", connectivity);
-  write_dataset(mesh_group, "element_types", elem_types);
-
-  close_group(mesh_group);
-}
-
-void UnstructuredMesh::set_length_multiplier(double length_multiplier)
-{
-  length_multiplier_ = length_multiplier;
-
-  if (length_multiplier_ != 1.0)
-    specified_length_multiplier_ = true;
-}
-
-ElementType UnstructuredMesh::element_type(int bin) const
-{
-  auto conn = connectivity(bin);
-
-  if (conn.size() == 4)
-    return ElementType::LINEAR_TET;
-  else if (conn.size() == 8)
-    return ElementType::LINEAR_HEX;
-  else
-    return ElementType::UNSUPPORTED;
-}
-
 StructuredMesh::MeshIndex StructuredMesh::get_indices(
   Position r, bool& in_mesh) const
 {
@@ -1727,6 +1555,178 @@ double SphericalMesh::volume(const MeshIndex& ijk) const
 
   return (1.0 / 3.0) * (r_o * r_o * r_o - r_i * r_i * r_i) *
          (std::cos(theta_i) - std::cos(theta_o)) * (phi_o - phi_i);
+}
+
+//==============================================================================
+// Unstructured Mesh implementation
+//==============================================================================
+
+UnstructuredMesh::UnstructuredMesh(pugi::xml_node node) : Mesh(node)
+{
+
+  // check the mesh type
+  if (check_for_node(node, "type")) {
+    auto temp = get_node_value(node, "type", true, true);
+    if (temp != mesh_type) {
+      fatal_error(fmt::format("Invalid mesh type: {}", temp));
+    }
+  }
+
+  // check if a length unit multiplier was specified
+  if (check_for_node(node, "length_multiplier")) {
+    length_multiplier_ = std::stod(get_node_value(node, "length_multiplier"));
+    specified_length_multiplier_ = true;
+  }
+
+  // get the filename of the unstructured mesh to load
+  if (check_for_node(node, "filename")) {
+    filename_ = get_node_value(node, "filename");
+    if (!file_exists(filename_)) {
+      fatal_error("Mesh file '" + filename_ + "' does not exist!");
+    }
+  } else {
+    fatal_error(fmt::format(
+      "No filename supplied for unstructured mesh with ID: {}", id_));
+  }
+
+  // check if mesh tally data should be written with
+  // statepoint files
+  if (check_for_node(node, "output")) {
+    output_ = get_node_value_bool(node, "output");
+  }
+}
+
+Position UnstructuredMesh::sample_tet(
+  std::array<Position, 4> coords, uint64_t* seed) const
+{
+  // Uniform distribution
+  double s = prn(seed);
+  double t = prn(seed);
+  double u = prn(seed);
+
+  // From PyNE implementation of moab tet sampling C. Rocchini & P. Cignoni
+  // (2000) Generating Random Points in a Tetrahedron, Journal of Graphics
+  // Tools, 5:4, 9-12, DOI: 10.1080/10867651.2000.10487528
+  if (s + t > 1) {
+    s = 1.0 - s;
+    t = 1.0 - t;
+  }
+  if (s + t + u > 1) {
+    if (t + u > 1) {
+      double old_t = t;
+      t = 1.0 - u;
+      u = 1.0 - s - old_t;
+    } else if (t + u <= 1) {
+      double old_s = s;
+      s = 1.0 - t - u;
+      u = old_s + t + u - 1;
+    }
+  }
+  return s * (coords[1] - coords[0]) + t * (coords[2] - coords[0]) +
+         u * (coords[3] - coords[0]) + coords[0];
+}
+
+const std::string UnstructuredMesh::mesh_type = "unstructured";
+
+std::string UnstructuredMesh::get_mesh_type() const
+{
+  return mesh_type;
+}
+
+void UnstructuredMesh::surface_bins_crossed(
+  Position r0, Position r1, const Direction& u, vector<int>& bins) const
+{
+  fatal_error("Unstructured mesh surface tallies are not implemented.");
+}
+
+std::string UnstructuredMesh::bin_label(int bin) const
+{
+  return fmt::format("Mesh Index ({})", bin);
+};
+
+void UnstructuredMesh::to_hdf5(hid_t group) const
+{
+  hid_t mesh_group = create_group(group, fmt::format("mesh {}", id_));
+
+  write_dataset(mesh_group, "type", mesh_type);
+  write_dataset(mesh_group, "filename", filename_);
+  write_dataset(mesh_group, "library", this->library());
+
+  if (specified_length_multiplier_)
+    write_dataset(mesh_group, "length_multiplier", length_multiplier_);
+
+  // write vertex coordinates
+  xt::xtensor<double, 2> vertices({static_cast<size_t>(this->n_vertices()), 3});
+  for (int i = 0; i < this->n_vertices(); i++) {
+    auto v = this->vertex(i);
+    xt::view(vertices, i, xt::all()) = xt::xarray<double>({v.x, v.y, v.z});
+  }
+  write_dataset(mesh_group, "vertices", vertices);
+
+  int num_elem_skipped = 0;
+
+  // write element types and connectivity
+  vector<double> volumes;
+  xt::xtensor<int, 2> connectivity({static_cast<size_t>(this->n_bins()), 8});
+  xt::xtensor<int, 2> elem_types({static_cast<size_t>(this->n_bins()), 1});
+  for (int i = 0; i < this->n_bins(); i++) {
+    auto conn = this->connectivity(i);
+
+    volumes.emplace_back(this->volume(i));
+
+    // write linear tet element
+    if (conn.size() == 4) {
+      xt::view(elem_types, i, xt::all()) =
+        static_cast<int>(ElementType::LINEAR_TET);
+      xt::view(connectivity, i, xt::all()) =
+        xt::xarray<int>({conn[0], conn[1], conn[2], conn[3], -1, -1, -1, -1});
+      // write linear hex element
+    } else if (conn.size() == 8) {
+      xt::view(elem_types, i, xt::all()) =
+        static_cast<int>(ElementType::LINEAR_HEX);
+      xt::view(connectivity, i, xt::all()) = xt::xarray<int>({conn[0], conn[1],
+        conn[2], conn[3], conn[4], conn[5], conn[6], conn[7]});
+    } else {
+      num_elem_skipped++;
+      xt::view(elem_types, i, xt::all()) =
+        static_cast<int>(ElementType::UNSUPPORTED);
+      xt::view(connectivity, i, xt::all()) = -1;
+    }
+  }
+
+  // warn users that some elements were skipped
+  if (num_elem_skipped > 0) {
+    warning(fmt::format("The connectivity of {} elements "
+                        "on mesh {} were not written "
+                        "because they are not of type linear tet/hex.",
+      num_elem_skipped, this->id_));
+  }
+
+  write_dataset(mesh_group, "volumes", volumes);
+  write_dataset(mesh_group, "connectivity", connectivity);
+  write_dataset(mesh_group, "element_types", elem_types);
+
+  close_group(mesh_group);
+}
+
+void UnstructuredMesh::set_length_multiplier(double length_multiplier)
+{
+  length_multiplier_ = length_multiplier;
+
+  if (length_multiplier_ != 1.0)
+    specified_length_multiplier_ = true;
+}
+
+ElementType UnstructuredMesh::element_type(int bin) const
+{
+  auto conn = connectivity(bin);
+
+  if (conn.size() == 4)
+    return ElementType::LINEAR_TET;
+  else if (conn.size() == 8)
+    return ElementType::LINEAR_HEX;
+  else
+    return ElementType::UNSUPPORTED;
 }
 
 //==============================================================================
